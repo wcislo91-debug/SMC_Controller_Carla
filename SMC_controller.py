@@ -101,9 +101,7 @@ class Controller2D(object):
         self.vars.create_var('v_err_prev', 0.0)
         self.vars.create_var('a_prev', 0.0)
         self.vars.create_var('throttle_prev', 0.0)
-
-        self.vars.create_var('e_y_prev', 0.0)
-        self.vars.create_var('e_psi_prev', 0.0)
+        self.vars.create_var('delta_prev', 0.0)
 
         if self._start_control_loop:
 
@@ -113,37 +111,30 @@ class Controller2D(object):
             ######################################################
             # LONGITUDINAL SMC (speed tracking)
             ######################################################
-            # Sliding surface: s_v = e_v + λ_v * e_v_dot
             lam_v = 0.8
-            k_v   = 1.2
-            phi_v = 0.5   # boundary layer
+            k_v   = 0.9
+            phi_v = 1.0   # larger boundary layer → smoother
 
             e_v = v - v_desired
             e_v_dot = (e_v - self.vars.v_err_prev) / dt
             self.vars.v_err_prev = e_v
 
             s_v = e_v + lam_v * e_v_dot
+            a_cmd = -k_v * np.tanh(s_v / phi_v)
 
-            # SMC control law (approx. acceleration command)
-            a_cmd = -k_v * np.tanh(s_v / max(phi_v, 1e-3))
-
-            # Smooth acceleration
-            a_cmd = 0.8 * self.vars.a_prev + 0.2 * a_cmd
+            # Filter acceleration command
+            a_cmd = 0.9 * self.vars.a_prev + 0.1 * a_cmd
             self.vars.a_prev = a_cmd
 
-            # Convert acceleration to throttle/brake
-            if a_cmd >= 0.0:
-                throttle_output = np.clip(a_cmd, 0.0, 1.0)
-                brake_output = 0.0
-            else:
-                throttle_output = 0.0
-                brake_output = np.clip(-a_cmd, 0.0, 1.0)
+            # Convert to throttle only (no brake)
+            throttle_output = np.clip(a_cmd, 0.0, 1.0)
+            brake_output = 0.0
 
             # Startup assist
             if v < 0.2 and v_desired > 0.5:
-                throttle_output = max(throttle_output, 0.22)
+                throttle_output = max(throttle_output, 0.25)
 
-            # Smooth throttle
+            # Smooth throttle transitions
             throttle_output = (
                 self.vars.throttle_prev +
                 np.clip(throttle_output - self.vars.throttle_prev, -0.03, 0.04)
@@ -151,13 +142,12 @@ class Controller2D(object):
             throttle_output = np.clip(throttle_output, 0.0, 1.0)
             self.vars.throttle_prev = throttle_output
 
-        ######################################################
-        # LATERAL SMC (FIXED SIGN)
-        ######################################################
+            ######################################################
+            # LATERAL SMC (path tracking)
+            ######################################################
             path_x = np.array([wp[0] for wp in waypoints])
             path_y = np.array([wp[1] for wp in waypoints])
 
-            # Nearest waypoint
             dx_all = path_x - x
             dy_all = path_y - y
             d2 = dx_all**2 + dy_all**2
@@ -173,42 +163,37 @@ class Controller2D(object):
 
             seg_dx = path_x[i1] - path_x[i0]
             seg_dy = path_y[i1] - path_y[i0]
-            if abs(seg_dx) < 1e-6 and abs(seg_dy) < 1e-6:
-                yaw_path = yaw
-            else:
-                yaw_path = np.arctan2(seg_dy, seg_dx)
+            yaw_path = np.arctan2(seg_dy, seg_dx + 1e-9)
 
-            # Heading error
+            # Heading and lateral errors
             e_psi = np.arctan2(np.sin(yaw_path - yaw),
                             np.cos(yaw_path - yaw))
 
-            # Lateral error (RIGHT positive)
             map_x = path_x[target_idx]
             map_y = path_y[target_idx]
             ex = x - map_x
             ey = y - map_y
-
             nx = -np.sin(yaw_path)
             ny =  np.cos(yaw_path)
-            e_y = -(ex * nx + ey * ny)
+            e_y = -(ex * nx + ey * ny)  # right positive
 
             # Sliding surface
-            lam_lat = 1.5
-            k_lat   = 0.8
-            phi_lat = 0.3
+            lam_lat = 1.2
+            k_lat   = 0.6 / max(v, 1.0)   # adaptive gain
+            phi_lat = 0.5
 
             s_lat = e_y + lam_lat * e_psi
 
-            # Deadzone to avoid tiny corrections on straight path
-            if abs(e_y) < 0.03 and abs(e_psi) < 0.015:
-                delta = 0.0
-            else:
-                # NOTE: SIGN FIX HERE → positive gain
-                delta = k_lat * np.tanh(s_lat / max(phi_lat, 1e-3))
+            # Smooth steering law (sign fixed)
+            delta = k_lat * np.tanh(s_lat / phi_lat)
 
+            # Filter steering
+            delta = 0.9 * self.vars.delta_prev + 0.1 * delta
+            self.vars.delta_prev = delta
+
+            # Clamp steering
             max_steer_rad = np.deg2rad(70.0)
             delta = np.clip(delta, -max_steer_rad, max_steer_rad)
-
             steer_output = delta
 
         ######################################################
